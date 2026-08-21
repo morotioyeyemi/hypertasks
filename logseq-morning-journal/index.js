@@ -382,7 +382,22 @@ async function run() {
 // Register triggers
 // ---------------------------------------------------------------------------
 function main() {
-  console.info('[morning-journal] loaded v17 (created-at sort, short-key aware)');
+  console.info('[morning-journal] loaded v18 (toolbar button)');
+
+  logseq.provideModel({
+    createMorningJournal: run,
+  });
+
+  logseq.App.registerUIItem('toolbar', {
+    key: 'morning-journal-toolbar',
+    template: `
+      <a class="button"
+         title="Create today's morning journal"
+         data-on-click="createMorningJournal">
+        <i class="ti ti-sun"></i>
+      </a>
+    `,
+  });
 
   logseq.App.registerCommandPalette(
     {
