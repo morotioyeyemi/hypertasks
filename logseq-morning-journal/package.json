@@ -1,0 +1,11 @@
+{
+  "name": "logseq-morning-journal",
+  "version": "1.0.0",
+  "description": "Create today's journal with overdue + due-today tracker task references (Logseq DB graph).",
+  "main": "index.html",
+  "author": "moyeyemi",
+  "logseq": {
+    "id": "logseq-morning-journal",
+    "title": "Morning Journal"
+  }
+}

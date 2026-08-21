@@ -1,0 +1,11 @@
+{
+  "name": "logseq-todomaster-db",
+  "version": "1.0.0",
+  "description": "Progress bar renderer for {{renderer :todomaster}} that works on Logseq DB graphs (status via :logseq.property/status).",
+  "main": "index.html",
+  "author": "moyeyemi",
+  "logseq": {
+    "id": "logseq-todomaster-db",
+    "title": "TODO Master (DB)"
+  }
+}
