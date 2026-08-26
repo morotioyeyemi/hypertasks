@@ -5,10 +5,10 @@
  * DB version of Logseq (which has no markdown files).
  *
  * On command it:
- *   1. Queries all open tracker tasks in the configured SCOPE (default "msft")
+ *   1. Queries open tracker tasks in the configured SCOPE (default "msft")
  *      on the TRACKER_PAGES. "Open" = has a status, excluding backlog, wait,
- *      done, and canceled. Deadlines are ignored.
- *   2. Sorts them by creation time (:block/created-at), oldest first.
+ *      done, and canceled. An optional setting limits tasks by deadline.
+ *   2. Sorts them by deadline when filtering, otherwise by creation time.
  *   3. Creates/opens today's journal and inserts:
  *        - top picks {{renderer :todomaster}}
  *            - ((block-ref)) for each open task, oldest-created first
@@ -30,6 +30,15 @@
 // ---------------------------------------------------------------------------
 const SCOPE_REF = 'msft';                   // keep only tasks under a tracker section that references [[msft]]; '' = keep all
 const TRACKER_PAGES = ['tracker'];          // work tracker only (tracker2 is personal)
+const settingsSchema = [
+  {
+    key: 'deadlineDaysAhead',
+    type: 'number',
+    default: -1,
+    title: 'Deadline days ahead',
+    description: '-1 includes all open tasks; 0 includes today only; 7 includes today through seven days from today. Undated tasks are excluded when set to 0 or more.',
+  },
+];
 // Statuses to leave OUT of the morning list. Built-in statuses are matched by
 // their :db/ident; custom statuses (e.g. WAIT) have no :db/ident and are
 // matched by title (case-insensitive). Everything not excluded counts as open.
@@ -69,6 +78,23 @@ function createdAtMs(entity) {
   if (ms == null) return null;
   const n = Number(ms);
   return isNaN(n) ? null : n;
+}
+
+/** Deadline is stored as an epoch-millis scalar on DB-graph tasks. */
+function deadlineMs(entity) {
+  const ms = pick(entity, 'logseq.property/deadline') ?? entity.deadline;
+  if (ms == null) return null;
+  const n = Number(ms);
+  return Number.isFinite(n) ? n : null;
+}
+
+function deadlineWindow(now) {
+  const configured = Number(logseq.settings && logseq.settings.deadlineDaysAhead);
+  const daysAhead = Number.isFinite(configured) ? Math.max(-1, Math.floor(configured)) : -1;
+  if (daysAhead < 0) return null;
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + daysAhead + 1).getTime();
+  return { start, end, daysAhead };
 }
 
 /** The status entity for a task, tolerating short/long result keys. */
@@ -196,6 +222,7 @@ async function dq(label, q) {
 /** List the top-level blocks (scope sections) under each tracker page. */
 async function diagnose() {
   if (!(await ensureGraph())) return;
+  const window = deadlineWindow(new Date());
   for (const pg of TRACKER_PAGES) {
     const rows = await dq(`top-level blocks of "${pg}"`,
       `[:find (pull ?b [:block/uuid :block/title :block/order
@@ -218,10 +245,12 @@ async function diagnose() {
   for (const t of tasks) {
     if (isExcludedStatus(t)) continue;
     if (SCOPE_REF && !ancestorRefNames(t).includes(SCOPE_REF.toLowerCase())) continue;
-    const ms = createdAtMs(t);
+    const deadline = deadlineMs(t);
+    if (window && (deadline == null || deadline < window.start || deadline >= window.end)) continue;
+    const ms = window ? deadline : createdAtMs(t);
     if (ms == null) continue;
     preview.push({
-      created: new Date(ms).toISOString(),
+      date: new Date(ms).toISOString(),
       ms,
       status: statusTitle(t),
       cats: categoryPath(t),
@@ -229,7 +258,7 @@ async function diagnose() {
     });
   }
   preview.sort((a, b) => a.ms - b.ms);
-  console.log(`[morning-journal][diag] open tasks = ${preview.length}`);
+  console.log(`[morning-journal][diag] matching open tasks = ${preview.length}`);
   console.log('[morning-journal][diag] sample (first 15):', JSON.stringify(preview.slice(0, 15)));
 }
 
@@ -238,6 +267,7 @@ async function queryTasks() {
   const q = `
     [:find (pull ?b [:block/uuid
                      :block/created-at
+                     :logseq.property/deadline
                      {:logseq.property/status [:db/ident :block/title]}
                      {:block/page [:block/name]}
                      {:block/parent [:block/title :block/name {:block/refs [:block/name]}
@@ -292,17 +322,18 @@ function buildBlocks(taskRefs) {
 async function run() {
   try {
     if (!(await ensureGraph())) return;
-    const today = journalDayOf(new Date());
+    const now = new Date();
+    const today = journalDayOf(now);
+    const window = deadlineWindow(now);
 
     const tasks = await queryTasks();
     const picks = [];
     const catCounts = {};
     const statusCounts = {};
-    let nNoUuid = 0, nNoCreated = 0, nExcluded = 0, nScopedOut = 0;
+    let nNoUuid = 0, nNoCreated = 0, nExcluded = 0, nScopedOut = 0, nDeadlineOut = 0;
     for (const t of tasks) {
       const uuid = uuidOf(t);
-      const ms = createdAtMs(t);
-      if (!uuid || ms == null) { if (!uuid) nNoUuid++; else nNoCreated++; continue; }
+      if (!uuid) { nNoUuid++; continue; }
 
       // Leave out backlog, wait, done, and canceled; keep everything else open.
       if (isExcludedStatus(t)) { nExcluded++; continue; }
@@ -313,17 +344,26 @@ async function run() {
         continue;
       }
 
+      const deadline = deadlineMs(t);
+      if (window && (deadline == null || deadline < window.start || deadline >= window.end)) {
+        nDeadlineOut++;
+        continue;
+      }
+      const sortMs = window ? deadline : createdAtMs(t);
+      if (sortMs == null) { nNoCreated++; continue; }
+
       const cats = categoryPath(t);
       const topCat = cats[0] || '(none)';
       catCounts[topCat] = (catCounts[topCat] || 0) + 1;
       const st = statusTitle(t);
       statusCounts[st] = (statusCounts[st] || 0) + 1;
-      picks.push({ uuid, ms });
+      picks.push({ uuid, ms: sortMs });
     }
-    // Sort by creation time, oldest first.
+    // Sort by deadline when filtering, otherwise by creation time.
     picks.sort((a, b) => a.ms - b.ms);
-    console.log(`[morning-journal][dbg] drops: noUuid=${nNoUuid} noCreated=${nNoCreated} excludedStatus=${nExcluded} scopedOut=${nScopedOut}`);
-    console.log(`[morning-journal] open tasks (excl backlog/wait/done/canceled): ${picks.length}`);
+    console.log(`[morning-journal][dbg] drops: noUuid=${nNoUuid} noCreated=${nNoCreated} excludedStatus=${nExcluded} scopedOut=${nScopedOut} deadlineOut=${nDeadlineOut}`);
+    const rangeLabel = window ? ` due today through +${window.daysAhead} day(s)` : '';
+    console.log(`[morning-journal] open tasks${rangeLabel}: ${picks.length}`);
     console.log('[morning-journal] category breakdown (top-level block):', catCounts);
     console.log('[morning-journal] status breakdown:', statusCounts);
 
@@ -369,7 +409,7 @@ async function run() {
     }
 
     logseq.UI.showMsg(
-      `Morning Journal: ${picks.length} open task(s) added.`,
+      `Morning Journal: ${picks.length} matching task(s) added.`,
       'success'
     );
   } catch (e) {
@@ -382,7 +422,7 @@ async function run() {
 // Register triggers
 // ---------------------------------------------------------------------------
 function main() {
-  console.info('[morning-journal] loaded v18 (toolbar button)');
+  console.info('[morning-journal] loaded v19 (configurable deadline window)');
 
   logseq.provideModel({
     createMorningJournal: run,
@@ -416,4 +456,4 @@ function main() {
   logseq.Editor.registerSlashCommand('Morning Journal', run);
 }
 
-logseq.ready(main).catch(console.error);
+logseq.useSettingsSchema(settingsSchema).ready(main).catch(console.error);
